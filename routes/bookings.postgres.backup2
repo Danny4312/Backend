@@ -1,0 +1,806 @@
+const express = require('express');
+const passport = require('passport');
+const { body, validationResult } = require('express-validator');
+const db = require('../config/database');
+const { sendNotification } = require('./notifications');
+const router = express.Router();
+
+// Middleware to authenticate JWT
+const authenticateJWT = passport.authenticate('jwt', { session: false });
+
+// Get bookings for current user
+router.get('/', authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+    const { status, page = 1, limit = 10 } = req.query;
+
+    let query, queryParams;
+
+    if (userType === 'traveler') {
+      // Get bookings made by traveler
+      query = `
+        SELECT b.*, s.title as service_title, s.description as service_description,
+               s.location as service_location, s.images as service_images,
+               sp.business_name, sp.location as provider_location,
+               u.first_name as provider_first_name, u.last_name as provider_last_name,
+               u.email as provider_email, u.phone as provider_phone
+        FROM bookings b
+        JOIN services s ON b.service_id = s.id
+        JOIN service_providers sp ON b.provider_id = sp.id
+        JOIN users u ON sp.user_id = u.id
+        WHERE b.traveler_id = $1
+      `;
+      queryParams = [userId];
+    } else if (userType === 'service_provider') {
+      // Get bookings for provider's services
+      console.log('🔍 [BOOKINGS] Service provider requesting bookings');
+      console.log('   User ID:', userId);
+      console.log('   User Type:', userType);
+      
+      const providerResult = await db.query('SELECT id FROM service_providers WHERE user_id = $1', [userId]);
+      console.log('   Provider query result:', providerResult.rows);
+      
+      if (providerResult.rows.length === 0) {
+        console.error('❌ No provider profile found for user_id:', userId);
+        return res.status(404).json({
+          success: false,
+          message: 'Service provider profile not found'
+        });
+      }
+
+      const providerId = providerResult.rows[0].id;
+      console.log('   Provider ID:', providerId);
+      
+      query = `
+        SELECT b.*, s.title as service_title, s.description as service_description,
+               s.location as service_location, s.images as service_images,
+               u.first_name as traveler_first_name, u.last_name as traveler_last_name,
+               u.email as traveler_email, u.phone as traveler_phone
+        FROM bookings b
+        JOIN services s ON b.service_id = s.id
+        JOIN users u ON b.traveler_id = u.id
+        WHERE b.provider_id = $1
+      `;
+      queryParams = [providerId];
+      console.log('   Query params:', queryParams);
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: 'Invalid user type'
+      });
+    }
+
+    // Add status filter if provided
+    if (status) {
+      query += ` AND b.status = $${queryParams.length + 1}`;
+      queryParams.push(status);
+    }
+
+    query += ` ORDER BY b.created_at DESC`;
+
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query += ` LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
+    queryParams.push(parseInt(limit), offset);
+
+    const result = await db.query(query, queryParams);
+    
+    if (userType === 'service_provider') {
+      console.log('   📊 Bookings found:', result.rows.length);
+      if (result.rows.length > 0) {
+        console.log('   📋 First booking:', result.rows[0]);
+      }
+    }
+
+    // Get total count for pagination
+    let countQuery = `SELECT COUNT(*) as total FROM bookings b WHERE `;
+    let countParams = [];
+
+    if (userType === 'traveler') {
+      countQuery += `b.traveler_id = $1`;
+      countParams = [userId];
+    } else {
+      const providerResult = await db.query('SELECT id FROM service_providers WHERE user_id = $1', [userId]);
+      const providerId = providerResult.rows[0].id;
+      countQuery += `b.provider_id = $1`;
+      countParams = [providerId];
+    }
+
+    if (status) {
+      countQuery += ` AND b.status = $${countParams.length + 1}`;
+      countParams.push(status);
+    }
+
+    const countResult = await db.query(countQuery, countParams);
+    const totalBookings = parseInt(countResult.rows[0].total);
+
+    res.json({
+      success: true,
+      bookings: result.rows.map(booking => ({
+        id: booking.id,
+        serviceId: booking.service_id,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        participants: booking.participants,
+        totalAmount: parseFloat(booking.total_amount),
+        status: booking.status,
+        paymentStatus: booking.payment_status,
+        specialRequests: booking.special_requests,
+        service: {
+          title: booking.service_title,
+          description: booking.service_description,
+          location: booking.service_location,
+          images: booking.service_images || []
+        },
+        ...(userType === 'traveler' ? {
+          provider: {
+            businessName: booking.business_name,
+            location: booking.provider_location,
+            ownerName: `${booking.provider_first_name} ${booking.provider_last_name}`,
+            email: booking.provider_email,
+            phone: booking.provider_phone
+          }
+        } : {
+          traveler: {
+            name: `${booking.traveler_first_name} ${booking.traveler_last_name}`,
+            email: booking.traveler_email,
+            phone: booking.traveler_phone
+          }
+        }),
+        createdAt: booking.created_at,
+        updatedAt: booking.updated_at
+      })),
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalBookings / limit),
+        totalBookings,
+        hasNext: page * limit < totalBookings,
+        hasPrev: page > 1
+      }
+    });
+  } catch (error) {
+    console.error('Get bookings error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching bookings'
+    });
+  }
+});
+
+// Get booking by ID
+router.get('/:id', authenticateJWT, async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+
+    let query = `
+      SELECT b.*, s.title as service_title, s.description as service_description,
+             s.location as service_location, s.images as service_images, s.price as service_price,
+             sp.business_name, sp.location as provider_location,
+             provider_user.first_name as provider_first_name, provider_user.last_name as provider_last_name,
+             provider_user.email as provider_email, provider_user.phone as provider_phone,
+             traveler_user.first_name as traveler_first_name, traveler_user.last_name as traveler_last_name,
+             traveler_user.email as traveler_email, traveler_user.phone as traveler_phone
+      FROM bookings b
+      JOIN services s ON b.service_id = s.id
+      JOIN service_providers sp ON b.provider_id = sp.id
+      JOIN users provider_user ON sp.user_id = provider_user.id
+      JOIN users traveler_user ON b.traveler_id = traveler_user.id
+      WHERE b.id = $1
+    `;
+
+    // Add user-specific filter
+    if (userType === 'traveler') {
+      query += ` AND b.traveler_id = $2`;
+    } else if (userType === 'service_provider') {
+      const providerResult = await db.query('SELECT id FROM service_providers WHERE user_id = $1', [userId]);
+      if (providerResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Service provider profile not found'
+        });
+      }
+      query += ` AND b.provider_id = $2`;
+      userId = providerResult.rows[0].id;
+    }
+
+    const result = await db.query(query, [bookingId, userId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found or you do not have permission to view it'
+      });
+    }
+
+    const booking = result.rows[0];
+
+    res.json({
+      success: true,
+      booking: {
+        id: booking.id,
+        serviceId: booking.service_id,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        participants: booking.participants,
+        totalAmount: parseFloat(booking.total_amount),
+        status: booking.status,
+        paymentStatus: booking.payment_status,
+        specialRequests: booking.special_requests,
+        service: {
+          title: booking.service_title,
+          description: booking.service_description,
+          location: booking.service_location,
+          images: booking.service_images || [],
+          price: parseFloat(booking.service_price)
+        },
+        provider: {
+          businessName: booking.business_name,
+          location: booking.provider_location,
+          ownerName: `${booking.provider_first_name} ${booking.provider_last_name}`,
+          email: booking.provider_email,
+          phone: booking.provider_phone
+        },
+        traveler: {
+          name: `${booking.traveler_first_name} ${booking.traveler_last_name}`,
+          email: booking.traveler_email,
+          phone: booking.traveler_phone
+        },
+        createdAt: booking.created_at,
+        updatedAt: booking.updated_at
+      }
+    });
+  } catch (error) {
+    console.error('Get booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching booking'
+    });
+  }
+});
+
+// Create new booking (any authenticated user except provider booking own service)
+router.post('/', [
+  authenticateJWT,
+  body('serviceId').isInt({ min: 1 }),
+  body('bookingDate').isISO8601(),
+  body('participants').isInt({ min: 1 }),
+  body('startTime').optional().matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/),
+  body('endTime').optional().matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/),
+  body('specialRequests').optional().trim()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+
+    const userId = req.user.id;
+
+    // Allow travelers and any user who is not a service provider for this specific service
+    // Service providers can't book their own services (checked later)
+    const { serviceId, bookingDate, participants, startTime, endTime, specialRequests } = req.body;
+
+    // Get service details and verify it exists
+    console.log('📝 Looking for service with ID:', serviceId);
+    
+    const serviceResult = await db.query(`
+      SELECT s.*, sp.id as provider_id, sp.user_id as provider_user_id, sp.business_name
+      FROM services s
+      JOIN service_providers sp ON s.provider_id = sp.id
+      WHERE s.id = $1 AND s.is_active = true
+    `, [serviceId]);
+
+    console.log('🔍 Service query result:', serviceResult.rows.length, 'rows');
+    
+    if (serviceResult.rows.length === 0) {
+      // Check if service exists but is inactive
+      const inactiveCheck = await db.query('SELECT id, is_active FROM services WHERE id = $1', [serviceId]);
+      
+      if (inactiveCheck.rows.length > 0) {
+        console.log('⚠️ Service exists but is inactive:', inactiveCheck.rows[0]);
+        return res.status(404).json({
+          success: false,
+          message: 'Service is currently inactive. Please contact the provider.'
+        });
+      }
+      
+      console.log('❌ Service not found in database with ID:', serviceId);
+      return res.status(404).json({
+        success: false,
+        message: 'Service not found. Please select a valid service.'
+      });
+    }
+    
+    console.log('✅ Service found:', serviceResult.rows[0].title);
+
+    const service = serviceResult.rows[0];
+
+    // Check if user is trying to book their own service
+    if (service.provider_user_id === userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'You cannot book your own service'
+      });
+    }
+
+    // Validate participants against max participants
+    if (service.max_participants && participants > service.max_participants) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum ${service.max_participants} participants allowed for this service`
+      });
+    }
+
+    // Calculate total amount
+    const totalAmount = service.price * participants;
+
+    // Create booking
+    const result = await db.query(`
+      INSERT INTO bookings (traveler_id, service_id, provider_id, booking_date, start_time, end_time, participants, total_price, special_requests)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [userId, serviceId, service.provider_id, bookingDate, startTime, endTime, participants, totalAmount, specialRequests]);
+
+    const booking = result.rows[0];
+
+    // Update service booking count
+    await db.query('UPDATE services SET total_bookings = total_bookings + 1 WHERE id = $1', [serviceId]);
+
+    // Send notification to service provider
+    await sendNotification(service.provider_user_id, 'booking_received', {
+      serviceTitle: service.title,
+      travelerName: `${req.user.firstName} ${req.user.lastName}`,
+      bookingId: booking.id,
+      bookingDate: bookingDate,
+      participants: participants,
+      totalAmount: totalAmount
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Booking created successfully',
+      booking: {
+        id: booking.id,
+        serviceId: booking.service_id,
+        bookingDate: booking.booking_date,
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        participants: booking.participants,
+        totalAmount: parseFloat(booking.total_price),
+        status: booking.status,
+        paymentStatus: booking.payment_status,
+        specialRequests: booking.special_requests,
+        createdAt: booking.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Create booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while creating booking'
+    });
+  }
+});
+
+// Update booking status (service providers can confirm/cancel, travelers can cancel)
+router.put('/:id/status', [
+  authenticateJWT,
+  body('status').isIn(['confirmed', 'cancelled', 'completed'])
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+
+    const bookingId = req.params.id;
+    const { status } = req.body;
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+
+    // Get booking details
+    const bookingResult = await db.query(`
+      SELECT b.*, sp.user_id as provider_user_id
+      FROM bookings b
+      JOIN service_providers sp ON b.provider_id = sp.id
+      WHERE b.id = $1
+    `, [bookingId]);
+
+    if (bookingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    const booking = bookingResult.rows[0];
+
+    // Check permissions
+    const isOwner = booking.traveler_id === userId;
+    const isProvider = booking.provider_user_id === userId;
+
+    if (!isOwner && !isProvider) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have permission to update this booking'
+      });
+    }
+
+    // Validate status transitions
+    if (userType === 'traveler') {
+      // Travelers can only cancel their own bookings
+      if (status !== 'cancelled') {
+        return res.status(403).json({
+          success: false,
+          message: 'Travelers can only cancel bookings'
+        });
+      }
+      if (!isOwner) {
+        return res.status(403).json({
+          success: false,
+          message: 'You can only cancel your own bookings'
+        });
+      }
+    } else if (userType === 'service_provider') {
+      // Providers can confirm, cancel, or complete bookings for their services
+      if (!isProvider) {
+        return res.status(403).json({
+          success: false,
+          message: 'You can only update bookings for your services'
+        });
+      }
+    }
+
+    // Check current status for valid transitions
+    if (booking.status === 'cancelled' || booking.status === 'completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot update status of cancelled or completed booking'
+      });
+    }
+
+    // Update booking status
+    const updateResult = await db.query(`
+      UPDATE bookings 
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+    `, [status, bookingId]);
+
+    const updatedBooking = updateResult.rows[0];
+
+    // Send notification to traveler about booking status update
+    try {
+      // Get full booking details for notification
+      const bookingDetailsResult = await db.query(`
+        SELECT b.*, s.title as service_title, 
+               sp.business_name as provider_name,
+               u_traveler.first_name as traveler_first_name, u_traveler.last_name as traveler_last_name,
+               u_provider.first_name as provider_first_name, u_provider.last_name as provider_last_name
+        FROM bookings b
+        JOIN services s ON b.service_id = s.id
+        JOIN service_providers sp ON b.provider_id = sp.id
+        JOIN users u_traveler ON b.traveler_id = u_traveler.id
+        JOIN users u_provider ON sp.user_id = u_provider.id
+        WHERE b.id = $1
+      `, [bookingId]);
+
+      if (bookingDetailsResult.rows.length > 0) {
+        const bookingDetails = bookingDetailsResult.rows[0];
+        
+        console.log('📧 Sending notification to traveler:', {
+          travelerId: bookingDetails.traveler_id,
+          status,
+          serviceTitle: bookingDetails.service_title
+        });
+
+        // Send notification based on status
+        if (status === 'confirmed') {
+          await sendNotification(bookingDetails.traveler_id, {
+            type: 'booking_confirmed',
+            title: '✅ Pre-Order Confirmed!',
+            message: `Good news! ${bookingDetails.provider_name} has confirmed your pre-order for "${bookingDetails.service_title}". They will contact you shortly with payment details.`,
+            data: {
+              bookingId: bookingId,
+              serviceTitle: bookingDetails.service_title,
+              providerName: bookingDetails.provider_name,
+              bookingDate: bookingDetails.booking_date
+            }
+          });
+          console.log('✅ Confirmation notification sent to traveler');
+        } else if (status === 'cancelled') {
+          await sendNotification(bookingDetails.traveler_id, {
+            type: 'booking_cancelled',
+            title: '❌ Pre-Order Rejected',
+            message: `Sorry, ${bookingDetails.provider_name} is unable to fulfill your pre-order for "${bookingDetails.service_title}". Please try booking another service or contact the provider for alternatives.`,
+            data: {
+              bookingId: bookingId,
+              serviceTitle: bookingDetails.service_title,
+              providerName: bookingDetails.provider_name
+            }
+          });
+          console.log('✅ Rejection notification sent to traveler');
+        } else if (status === 'completed') {
+          await sendNotification(bookingDetails.traveler_id, {
+            type: 'booking_completed',
+            title: '🎉 Trip Completed!',
+            message: `Your trip "${bookingDetails.service_title}" with ${bookingDetails.provider_name} is marked as completed. We hope you had a great experience! Please leave a review.`,
+            data: {
+              bookingId: bookingId,
+              serviceTitle: bookingDetails.service_title,
+              providerName: bookingDetails.provider_name
+            }
+          });
+          console.log('✅ Completion notification sent to traveler');
+        }
+      }
+    } catch (notificationError) {
+      console.error('⚠️  Error sending notification:', notificationError);
+      // Don't fail the request if notification fails
+    }
+
+    res.json({
+      success: true,
+      message: `Booking ${status} successfully`,
+      booking: {
+        id: updatedBooking.id,
+        status: updatedBooking.status,
+        updatedAt: updatedBooking.updated_at
+      }
+    });
+  } catch (error) {
+    console.error('Update booking status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while updating booking status'
+    });
+  }
+});
+
+// Delete booking (providers can delete completed/cancelled bookings)
+router.delete('/:id', authenticateJWT, async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    const userId = req.user.id;
+    const userType = req.user.user_type;
+
+    console.log('🗑️  [DELETE BOOKING] Request:', { bookingId, userId, userType });
+
+    // Get booking details
+    const bookingResult = await db.query(`
+      SELECT b.*, sp.user_id as provider_user_id
+      FROM bookings b
+      JOIN service_providers sp ON b.provider_id = sp.id
+      WHERE b.id = $1
+    `, [bookingId]);
+
+    if (bookingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    const booking = bookingResult.rows[0];
+
+    // Check permissions - only provider can delete their bookings
+    const isProvider = booking.provider_user_id === userId;
+
+    if (!isProvider) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have permission to delete this booking'
+      });
+    }
+
+    // Only allow deleting completed or cancelled bookings
+    if (booking.status !== 'completed' && booking.status !== 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only completed or cancelled bookings can be deleted'
+      });
+    }
+
+    // Delete the booking
+    await db.query('DELETE FROM bookings WHERE id = $1', [bookingId]);
+
+    console.log('✅ [DELETE BOOKING] Booking deleted successfully:', bookingId);
+
+    res.json({
+      success: true,
+      message: 'Booking deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while deleting booking'
+    });
+  }
+});
+
+// Update payment status (for future payment integration)
+router.put('/:id/payment', [
+  authenticateJWT,
+  body('paymentStatus').isIn(['paid', 'refunded'])
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+
+    const bookingId = req.params.id;
+    const { paymentStatus } = req.body;
+    const userId = req.user.id;
+
+    // For now, only allow service providers to update payment status
+    if (req.user.user_type !== 'service_provider') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only service providers can update payment status'
+      });
+    }
+
+    // Verify provider owns this booking
+    const bookingResult = await db.query(`
+      SELECT b.id
+      FROM bookings b
+      JOIN service_providers sp ON b.provider_id = sp.id
+      WHERE b.id = $1 AND sp.user_id = $2
+    `, [bookingId, userId]);
+
+    if (bookingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found or you do not have permission to update it'
+      });
+    }
+
+    // Update payment status
+    const updateResult = await db.query(`
+      UPDATE bookings 
+      SET payment_status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+    `, [paymentStatus, bookingId]);
+
+    const updatedBooking = updateResult.rows[0];
+
+    res.json({
+      success: true,
+      message: `Payment status updated to ${paymentStatus}`,
+      booking: {
+        id: updatedBooking.id,
+        paymentStatus: updatedBooking.payment_status,
+        updatedAt: updatedBooking.updated_at
+      }
+    });
+  } catch (error) {
+    console.error('Update payment status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while updating payment status'
+    });
+  }
+});
+
+// Add review for completed booking (travelers only)
+router.post('/:id/review', [
+  authenticateJWT,
+  body('rating').isInt({ min: 1, max: 5 }),
+  body('comment').optional().trim().isLength({ max: 1000 })
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+
+    const bookingId = req.params.id;
+    const { rating, comment } = req.body;
+    const userId = req.user.id;
+
+    if (req.user.user_type !== 'traveler') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only travelers can add reviews'
+      });
+    }
+
+    // Get booking details and verify ownership
+    const bookingResult = await db.query(`
+      SELECT b.*, s.id as service_id, sp.id as provider_id
+      FROM bookings b
+      JOIN services s ON b.service_id = s.id
+      JOIN service_providers sp ON b.provider_id = sp.id
+      WHERE b.id = $1 AND b.traveler_id = $2
+    `, [bookingId, userId]);
+
+    if (bookingResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found or you do not have permission to review it'
+      });
+    }
+
+    const booking = bookingResult.rows[0];
+
+    // Check if booking is completed
+    if (booking.status !== 'completed') {
+      return res.status(400).json({
+        success: false,
+        message: 'You can only review completed bookings'
+      });
+    }
+
+    // Check if review already exists
+    const existingReview = await db.query('SELECT id FROM reviews WHERE booking_id = $1', [bookingId]);
+    if (existingReview.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already reviewed this booking'
+      });
+    }
+
+    // Create review
+    const reviewResult = await db.query(`
+      INSERT INTO reviews (booking_id, traveler_id, service_id, provider_id, rating, comment)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *
+    `, [bookingId, userId, booking.service_id, booking.provider_id, rating, comment]);
+
+    const review = reviewResult.rows[0];
+
+    // Update provider's average rating
+    await db.query(`
+      UPDATE service_providers 
+      SET rating = (
+        SELECT AVG(rating) 
+        FROM reviews 
+        WHERE provider_id = $1
+      )
+      WHERE id = $1
+    `, [booking.provider_id]);
+
+    res.status(201).json({
+      success: true,
+      message: 'Review added successfully',
+      review: {
+        id: review.id,
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Add review error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while adding review'
+    });
+  }
+});
+
+module.exports = router;

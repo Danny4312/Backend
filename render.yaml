@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: isafari-global-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        value: isafari_global_super_secret_jwt_key_2024_production
+      - key: SESSION_SECRET
+        value: isafari_session_secret_key_2024
+      - key: FRONTEND_URL
+        value: https://isafari-global.netlify.app
+
+databases:
+  - name: isafari-postgres
+    plan: free

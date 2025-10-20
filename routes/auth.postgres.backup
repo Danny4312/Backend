@@ -1,0 +1,271 @@
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const passport = require('passport');
+const { body, validationResult } = require('express-validator');
+const { getValidationMiddleware } = require('../middleware/validation');
+const db = require('../config/database');
+const router = express.Router();
+
+// Generate JWT token
+const generateToken = (user) => {
+  return jwt.sign(
+    { 
+      id: user.id, 
+      email: user.email, 
+      userType: user.user_type 
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
+};
+
+// Register endpoint
+router.post('/register', getValidationMiddleware('register'), async (req, res) => {
+  try {
+
+    const { 
+      email, password, firstName, lastName, userType, phone, googleId,
+      serviceLocation, serviceCategories, locationData, companyName, businessType, description
+    } = req.body;
+
+    // Check if user already exists
+    const existingUser = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'User already exists with this email'
+      });
+    }
+
+    // Hash password if provided
+    let hashedPassword = null;
+    if (password) {
+      hashedPassword = await bcrypt.hash(password, 12);
+    }
+
+    // Create user
+    const newUser = await db.query(
+      `INSERT INTO users (email, password_hash, first_name, last_name, phone, user_type, google_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [email, hashedPassword, firstName, lastName, phone || null, userType, googleId || null]
+    );
+
+    const user = newUser.rows[0];
+
+    // Create service provider profile if user is a service provider
+    if (userType === 'service_provider') {
+      const businessName = companyName || `${firstName} ${lastName}'s Business`;
+      const categoriesJson = serviceCategories ? JSON.stringify(serviceCategories) : null;
+      const locationJson = locationData ? JSON.stringify(locationData) : null;
+      
+      await db.query(
+        `INSERT INTO service_providers 
+         (user_id, business_name, business_type, location, service_categories, location_data, description) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [user.id, businessName, businessType, serviceLocation, categoriesJson, locationJson, description]
+      );
+    }
+
+    // Generate token
+    const token = generateToken(user);
+
+    res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        userType: user.user_type,
+        isVerified: user.is_verified
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during registration'
+    });
+  }
+});
+
+// Login endpoint
+router.post('/login', getValidationMiddleware('login'), async (req, res) => {
+  try {
+
+    const { email, password } = req.body;
+
+    // Find user
+    const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    // Check password
+    if (!user.password_hash) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please use Google login for this account'
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Generate token
+    const token = generateToken(user);
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        userType: user.user_type,
+        isVerified: user.is_verified
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during login'
+    });
+  }
+});
+
+// Google OAuth routes
+router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+
+router.get('/google/callback', 
+  passport.authenticate('google', { failureRedirect: `${process.env.FRONTEND_URL}/login?error=oauth_failed` }),
+  async (req, res) => {
+    try {
+      // Generate JWT token for the authenticated user
+      const authToken = jwt.sign(
+        { 
+          id: req.user.id, 
+          email: req.user.email, 
+          user_type: req.user.user_type 
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN }
+      );
+
+      // Successful authentication, redirect to frontend with token
+      res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${authToken}&user_type=${req.user.user_type}`);
+    } catch (error) {
+      console.error('Google callback error:', error);
+      res.redirect(`${process.env.FRONTEND_URL}/login?error=auth_failed`);
+    }
+  }
+);
+
+// Get temporary Google user data for registration
+router.get('/google/temp', (req, res) => {
+  if (req.session.tempGoogleUser) {
+    res.json({
+      success: true,
+      user: req.session.tempGoogleUser
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      message: 'No temporary user data found'
+    });
+  }
+});
+
+// Complete Google registration
+router.post('/google/complete', [
+  body('userType').isIn(['traveler', 'service_provider']),
+  body('phone').optional().isMobilePhone()
+], async (req, res) => {
+  try {
+    const { userType, phone } = req.body;
+    const tempUser = req.session.tempGoogleUser;
+
+    if (!tempUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'No temporary user data found'
+      });
+    }
+
+    // Create user with Google data
+    const newUser = await db.query(
+      `INSERT INTO users (email, first_name, last_name, phone, user_type, google_id, avatar_url, is_verified)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [tempUser.email, tempUser.firstName, tempUser.lastName, phone, userType, tempUser.googleId, tempUser.avatarUrl, true]
+    );
+
+    const user = newUser.rows[0];
+
+    // Create service provider profile if needed
+    if (userType === 'service_provider') {
+      await db.query(
+        `INSERT INTO service_providers (user_id, business_name) VALUES ($1, $2)`,
+        [user.id, `${tempUser.firstName} ${tempUser.lastName}'s Business`]
+      );
+    }
+
+    // Clear temporary data
+    delete req.session.tempGoogleUser;
+
+    // Generate token
+    const token = generateToken(user);
+
+    res.json({
+      success: true,
+      message: 'Registration completed successfully',
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        userType: user.user_type,
+        isVerified: user.is_verified
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Google registration completion error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during registration completion'
+    });
+  }
+});
+
+// Verify token endpoint
+router.get('/verify', passport.authenticate('jwt', { session: false }), (req, res) => {
+  res.json({
+    success: true,
+    user: {
+      id: req.user.id,
+      email: req.user.email,
+      firstName: req.user.first_name,
+      lastName: req.user.last_name,
+      userType: req.user.user_type,
+      isVerified: req.user.is_verified
+    }
+  });
+});
+
+module.exports = router;

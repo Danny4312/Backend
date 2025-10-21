@@ -92,10 +92,16 @@ router.post('/register', getValidationMiddleware('register'), async (req, res) =
       token
     });
   } catch (error) {
-    console.error('Registration error:', error);
+    console.error('❌ REGISTRATION ERROR DETAILS:');
+    console.error('Error Message:', error.message);
+    console.error('Error Stack:', error.stack);
+    console.error('Error Name:', error.name);
+    console.error('Full Error:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+    
     res.status(500).json({
       success: false,
-      message: 'Server error during registration'
+      message: 'Server error during registration',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });

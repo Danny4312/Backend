@@ -33,7 +33,6 @@ const userSchema = new mongoose.Schema({
   },
   google_id: {
     type: String,
-    unique: true,
     sparse: true
   },
   avatar_url: {
@@ -53,7 +52,8 @@ const userSchema = new mongoose.Schema({
 
 // Indexes
 userSchema.index({ email: 1 });
-userSchema.index({ google_id: 1 });
+// Sparse unique index for google_id - allows multiple null values
+userSchema.index({ google_id: 1 }, { unique: true, sparse: true, partialFilterExpression: { google_id: { $exists: true, $ne: null } } });
 userSchema.index({ user_type: 1 });
 
 module.exports = mongoose.model('User', userSchema);

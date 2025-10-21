@@ -201,4 +201,76 @@ router.delete('/:id', authenticateJWT, async (req, res) => {
   }
 });
 
+// Get recent activity for homepage (public endpoint)
+router.get('/recent-activity', async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+
+    // Get recent bookings
+    const recentBookings = await Booking.find({ 
+      status: { $in: ['confirmed', 'completed'] } 
+    })
+      .populate('service_id', 'title category location')
+      .populate('traveler_id', 'first_name last_name')
+      .sort({ created_at: -1 })
+      .limit(parseInt(limit))
+      .lean();
+
+    // Format activities
+    const activities = recentBookings.map(booking => {
+      const firstName = booking.traveler_id?.first_name || 'Anonymous';
+      const lastName = booking.traveler_id?.last_name?.[0] || '';
+      
+      return {
+        id: booking._id,
+        type: 'booking',
+        user: `${firstName} ${lastName}.`,
+        action: `booked ${booking.service_id?.title || 'a service'}`,
+        location: booking.service_id?.location || 'Unknown location',
+        timestamp: booking.created_at,
+        category: booking.service_id?.category || 'general'
+      };
+    });
+
+    // Get stats
+    const now = new Date();
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const [weeklyBookings, totalBookings, activeServices] = await Promise.all([
+      Booking.countDocuments({ 
+        created_at: { $gte: weekAgo },
+        status: { $in: ['confirmed', 'completed'] }
+      }),
+      Booking.countDocuments({ status: { $in: ['confirmed', 'completed'] } }),
+      Service.countDocuments({ is_active: true })
+    ]);
+
+    // Get active travelers (users who booked in last 30 days)
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const activeTravelers = await Booking.distinct('traveler_id', {
+      created_at: { $gte: monthAgo }
+    });
+
+    // Get unique destinations
+    const destinations = await Service.distinct('location', { is_active: true });
+
+    res.json({
+      success: true,
+      activities,
+      stats: {
+        weeklyBookings,
+        activeTravelers: activeTravelers.length,
+        destinations: destinations.length,
+        totalServices: activeServices
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching recent activity:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching recent activity'
+    });
+  }
+});
+
 module.exports = router;

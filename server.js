@@ -33,13 +33,14 @@ app.use(helmet());
 // });
 // app.use(limiter);
 
-// CORS configuration - Allow multiple origins for development
+// CORS configuration - Allow multiple origins including production
 const allowedOrigins = [
   'http://localhost:4028',
   'http://localhost:5173',
   'http://localhost:3000',
   'http://127.0.0.1:4028',
   'http://127.0.0.1:5173',
+  'https://backend-bncb.onrender.com',
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
@@ -48,7 +49,15 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
+    // Check if origin is in allowed list
     if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else if (origin && (
+      origin.includes('.netlify.app') || 
+      origin.includes('.vercel.app') ||
+      origin.includes('onrender.com')
+    )) {
+      // Allow all Netlify, Vercel, and Render deployments
       callback(null, true);
     } else {
       // In development, allow all origins

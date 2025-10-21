@@ -2,7 +2,7 @@
   "name": "isafari-global-backend",
   "version": "1.0.0",
   "description": "Backend API for iSafari Global travel platform",
-  "main": "full-server.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",

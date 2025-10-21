@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: isafari-global-backend
+    name: backend-bncb
     env: node
     plan: free
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node server.js
     envVars:
       - key: NODE_ENV
         value: production
@@ -16,7 +16,7 @@ services:
         value: isafari_session_secret_key_2024
       - key: FRONTEND_URL
         value: https://isafari-global.netlify.app
-
-databases:
-  - name: isafari-postgres
-    plan: free
+      - key: MONGODB_URI
+        value: mongodb+srv://d34911651_db_user:jeda%40123@cluster0.c8dw3ca.mongodb.net/isafari_global?retryWrites=true&w=majority&appName=Cluster0
+      - key: MONGODB_DB_NAME
+        value: isafari_global

@@ -273,4 +273,163 @@ router.get('/recent-activity', async (req, res) => {
   }
 });
 
+// Get provider analytics
+router.get('/provider-analytics', authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { timeRange = '30days' } = req.query;
+
+    // Get provider
+    const provider = await ServiceProvider.findOne({ user_id: toObjectId(userId) });
+    if (!provider) {
+      return res.status(404).json({ success: false, message: 'Provider profile not found' });
+    }
+
+    // Calculate date range
+    const now = new Date();
+    let startDate;
+    switch (timeRange) {
+      case '7days':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case '90days':
+        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+        break;
+      case '1year':
+        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    }
+
+    // Get bookings
+    const bookings = await Booking.find({
+      provider_id: provider._id,
+      created_at: { $gte: startDate }
+    })
+      .populate('service_id', 'title category price')
+      .populate('traveler_id', 'first_name last_name country')
+      .lean();
+
+    // Calculate metrics
+    const confirmedBookings = bookings.filter(b => ['confirmed', 'completed'].includes(b.status));
+    const totalRevenue = confirmedBookings.reduce((sum, b) => sum + (b.total_price || 0), 0);
+    const totalBookings = confirmedBookings.length;
+    const uniqueCustomers = [...new Set(bookings.map(b => b.traveler_id?._id?.toString()).filter(Boolean))].length;
+
+    // Calculate average rating
+    const reviewedBookings = bookings.filter(b => b.rating);
+    const averageRating = reviewedBookings.length > 0
+      ? (reviewedBookings.reduce((sum, b) => sum + b.rating, 0) / reviewedBookings.length).toFixed(1)
+      : 0;
+
+    // Calculate growth
+    const previousStartDate = new Date(startDate.getTime() - (now.getTime() - startDate.getTime()));
+    const previousBookings = await Booking.find({
+      provider_id: provider._id,
+      created_at: { $gte: previousStartDate, $lt: startDate },
+      status: { $in: ['confirmed', 'completed'] }
+    }).lean();
+
+    const previousRevenue = previousBookings.reduce((sum, b) => sum + (b.total_price || 0), 0);
+    const revenueGrowth = previousRevenue > 0 ? (((totalRevenue - previousRevenue) / previousRevenue) * 100).toFixed(1) : 0;
+    const bookingsGrowth = previousBookings.length > 0 ? (((totalBookings - previousBookings.length) / previousBookings.length) * 100).toFixed(1) : 0;
+
+    // Top services
+    const serviceStats = {};
+    confirmedBookings.forEach(booking => {
+      if (!booking.service_id) return;
+      const sid = booking.service_id._id.toString();
+      if (!serviceStats[sid]) {
+        serviceStats[sid] = {
+          name: booking.service_id.title,
+          bookings: 0,
+          revenue: 0,
+          ratings: []
+        };
+      }
+      serviceStats[sid].bookings++;
+      serviceStats[sid].revenue += booking.total_price || 0;
+      if (booking.rating) serviceStats[sid].ratings.push(booking.rating);
+    });
+
+    const topServices = Object.values(serviceStats)
+      .map(s => ({
+        name: s.name,
+        bookings: s.bookings,
+        revenue: s.revenue,
+        rating: s.ratings.length > 0 ? (s.ratings.reduce((a, b) => a + b) / s.ratings.length).toFixed(1) : 0
+      }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 5);
+
+    // Customer insights
+    const countryStats = {};
+    bookings.forEach(b => {
+      const country = b.traveler_id?.country || 'Unknown';
+      countryStats[country] = (countryStats[country] || 0) + 1;
+    });
+
+    const topCountries = Object.entries(countryStats)
+      .map(([country, bookings]) => ({
+        country,
+        bookings,
+        percentage: totalBookings > 0 ? Math.round((bookings / totalBookings) * 100) : 0
+      }))
+      .sort((a, b) => b.bookings - a.bookings)
+      .slice(0, 5);
+
+    // Monthly data (last 6 months)
+    const monthlyData = [];
+    for (let i = 5; i >= 0; i--) {
+      const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 0);
+      
+      const monthBookings = bookings.filter(b => {
+        const date = new Date(b.created_at);
+        return date >= monthStart && date <= monthEnd && ['confirmed', 'completed'].includes(b.status);
+      });
+
+      monthlyData.push({
+        month: monthStart.toLocaleDateString('en-US', { month: 'short' }),
+        revenue: monthBookings.reduce((sum, b) => sum + (b.total_price || 0), 0),
+        bookings: monthBookings.length
+      });
+    }
+
+    res.json({
+      success: true,
+      analytics: {
+        revenue: {
+          total: totalRevenue,
+          growth: parseFloat(revenueGrowth),
+          trend: revenueGrowth >= 0 ? 'up' : 'down'
+        },
+        bookings: {
+          total: totalBookings,
+          growth: parseFloat(bookingsGrowth),
+          trend: bookingsGrowth >= 0 ? 'up' : 'down'
+        },
+        customers: {
+          total: uniqueCustomers,
+          growth: 0,
+          trend: 'neutral'
+        },
+        rating: {
+          average: parseFloat(averageRating),
+          total: reviewedBookings.length,
+          growth: 0,
+          trend: 'neutral'
+        }
+      },
+      topServices,
+      monthlyData,
+      topCountries
+    });
+  } catch (error) {
+    console.error('❌ Error fetching provider analytics:', error);
+    res.status(500).json({ success: false, message: 'Error fetching analytics' });
+  }
+});
+
 module.exports = router;

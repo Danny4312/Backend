@@ -28,13 +28,24 @@ router.post('/register', getValidationMiddleware('register'), async (req, res) =
       serviceLocation, serviceCategories, locationData, companyName, businessType, description
     } = req.body;
 
-    // Check if user already exists
+    // Check if user already exists by email
     const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
       return res.status(400).json({
         success: false,
         message: 'User already exists with this email'
       });
+    }
+
+    // Check if Google ID already exists (only if googleId is provided)
+    if (googleId) {
+      const existingGoogleUser = await User.findOne({ google_id: googleId });
+      if (existingGoogleUser) {
+        return res.status(400).json({
+          success: false,
+          message: 'This Google account is already registered'
+        });
+      }
     }
 
     // Hash password if provided

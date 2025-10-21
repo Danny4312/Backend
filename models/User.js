@@ -52,8 +52,8 @@ const userSchema = new mongoose.Schema({
 
 // Indexes
 userSchema.index({ email: 1 });
-// Sparse unique index for google_id - allows multiple null values
-userSchema.index({ google_id: 1 }, { unique: true, sparse: true, partialFilterExpression: { google_id: { $exists: true, $ne: null } } });
+// Note: google_id does NOT have a unique index to allow multiple null values
+// Uniqueness for non-null google_id values is enforced in application logic
 userSchema.index({ user_type: 1 });
 
 module.exports = mongoose.model('User', userSchema);
